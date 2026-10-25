@@ -56,6 +56,8 @@ app = FastAPI(redirect_slashes=False)  # never redirect grader requests
 RUNS: Dict[str, Dict[str, Any]] = {}
 INCIDENT_CACHE: Dict[str, Dict[str, Any]] = {}  # incidentId -> {"evidence_lines": [...]}
 LOCK = asyncio.Lock()
+DEBUG_RUNS: List[Dict[str, Any]] = []  # last few runs, for /debug/last (no sensitive data)
+DEBUG_MAX = 8
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -205,26 +207,29 @@ def build_planner_messages(req: Dict[str, Any], evidence_lines: List[Dict[str, s
 
 
 async def call_model(messages: List[Dict[str, str]]) -> Tuple[str, str]:
-    """Return (content, model_name). Raises on failure."""
+    """Return (content, model_name). Raises RuntimeError with detail on failure."""
     url = f"{AI_BASE_URL}/chat/completions"
     headers = {"Content-Type": "application/json"}
     if AI_API_KEY:
         headers["Authorization"] = f"Bearer {AI_API_KEY}"
     body = {"model": AI_MODEL, "messages": messages, "temperature": 0}
+    last = "no attempt made"
     async with httpx.AsyncClient(timeout=AI_TIMEOUT) as client:
         # Try with JSON mode; fall back without it if the provider rejects it.
         for extra in ({"response_format": {"type": "json_object"}}, {}):
             try:
                 r = await client.post(url, headers=headers, json={**body, **extra})
                 if r.status_code >= 400:
+                    last = f"HTTP {r.status_code} at {url}: {r.text[:300]}"
                     continue
                 data = r.json()
                 content = data["choices"][0]["message"]["content"]
                 model = data.get("model", AI_MODEL)
                 return content, model
-            except Exception:
+            except Exception as e:
+                last = f"{type(e).__name__}: {e} (url={url})"
                 continue
-    raise RuntimeError("model call failed")
+    raise RuntimeError(last)
 
 
 def parse_decision(content: str) -> Dict[str, Any]:
@@ -310,8 +315,8 @@ def heuristic_decision(req: Dict[str, Any], evidence_lines: List[Dict[str, str]]
     }
 
 
-async def plan(req: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
-    """Return (decision, model_name). Exactly one model call per run."""
+async def plan(req: Dict[str, Any]) -> Tuple[Dict[str, Any], str, Dict[str, Any]]:
+    """Return (decision, model_name, diag). Exactly one model call per run."""
     incident = req.get("incident", {})
     incident_id = incident.get("incidentId") or ""
     cache = INCIDENT_CACHE.get(incident_id)
@@ -323,15 +328,21 @@ async def plan(req: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
 
     if _PLANNER_OVERRIDE is not None:
         decision = _PLANNER_OVERRIDE(req)
-        return validate_decision(decision, req, evidence_lines), decision.get("_model", AI_MODEL)
+        return (validate_decision(decision, req, evidence_lines),
+                decision.get("_model", AI_MODEL),
+                {"source": "override", "model_ok": True, "error": None})
 
     messages = build_planner_messages(req, evidence_lines)
     try:
         content, model_name = await call_model(messages)
         decision = parse_decision(content)
-        return validate_decision(decision, req, evidence_lines), model_name
-    except Exception:
-        return heuristic_decision(req, evidence_lines), AI_MODEL
+        return (validate_decision(decision, req, evidence_lines), model_name,
+                {"source": "model", "model_ok": True, "error": None, "raw": content[:600]})
+    except Exception as e:
+        detail = f"{type(e).__name__}: {e}"
+        print(f"[plan] MODEL CALL FAILED -> heuristic fallback: {detail}", flush=True)
+        return (heuristic_decision(req, evidence_lines), AI_MODEL,
+                {"source": "heuristic", "model_ok": False, "error": detail})
 
 
 # --------------------------------------------------------------------------- #
@@ -554,6 +565,39 @@ async def healthz():
     return {"ok": True}
 
 
+@app.on_event("startup")
+async def _startup():
+    print(f"[startup] AI_BASE_URL={AI_BASE_URL} AI_MODEL={AI_MODEL} "
+          f"key_present={bool(AI_API_KEY)} timeout={AI_TIMEOUT}", flush=True)
+
+
+@app.get("/debug/selftest")
+async def debug_selftest():
+    """Live-ping the model. Confirms the AI config WITHOUT spending an exam check."""
+    diag = {
+        "base_url": AI_BASE_URL,
+        "model": AI_MODEL,
+        "key_present": bool(AI_API_KEY),
+        "timeout": AI_TIMEOUT,
+    }
+    try:
+        content, model = await call_model([
+            {"role": "user", "content": "Reply with exactly the word OK."}])
+        diag["model_ok"] = True
+        diag["model_returned"] = model
+        diag["sample"] = content[:200]
+    except Exception as e:
+        diag["model_ok"] = False
+        diag["error"] = f"{type(e).__name__}: {e}"
+    return JSONResponse(diag)
+
+
+@app.get("/debug/last")
+async def debug_last():
+    """The last few incidents the grader sent + what we decided (no sensitive data)."""
+    return JSONResponse({"count": len(DEBUG_RUNS), "runs": DEBUG_RUNS[-3:]})
+
+
 @app.post("/v2/incidents")
 async def post_incident(request: Request):
     try:
@@ -587,7 +631,7 @@ async def post_incident(request: Request):
         else:
             trace_id, incoming_parent, tracestate = new_trace_id(), None, None
 
-        decision, model_name = await plan(body)
+        decision, model_name, model_diag = await plan(body)
 
         policy = body.get("policy", {})
         approval_for = set(policy.get("approvalRequiredFor", []) or [])
@@ -650,6 +694,35 @@ async def post_incident(request: Request):
         run["first_response"] = resp
         run["latest_response"] = resp
         RUNS[run_id] = run
+
+        # Debug record (no sensitive object, transcript trimmed) for /debug/last.
+        incident = body.get("incident", {})
+        ev_lines = INCIDENT_CACHE.get(run["incidentId"], {}).get("evidence_lines", [])
+        DEBUG_RUNS.append({
+            "runId": run_id,
+            "incidentId": run["incidentId"],
+            "model": model_diag,
+            "decision": decision,
+            "first_response": resp,
+            "request_summary": {
+                "profile": body.get("profile"),
+                "agentName": body.get("agentName"),
+                "publicMarker": body.get("publicMarker"),
+                "incident": {
+                    "incidentId": incident.get("incidentId"),
+                    "title": incident.get("title"),
+                    "service": incident.get("service"),
+                    "severity": incident.get("severity"),
+                    "allowedRootCauses": incident.get("allowedRootCauses"),
+                    "evidence_line_count": len(ev_lines),
+                    "evidence_sample": ev_lines[:30],
+                    "transcript_head": (incident.get("transcript", "") or "")[:1200],
+                },
+                "toolCatalog": body.get("toolCatalog"),
+                "policy": body.get("policy"),
+            },
+        })
+        del DEBUG_RUNS[:-DEBUG_MAX]
 
         if too_big(resp):
             return err(500, "response too large")
